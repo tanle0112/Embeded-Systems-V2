@@ -1,0 +1,149 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+#include <DHT20.h>   
+#define I2C1_SDA       7
+#define I2C1_SCL       6
+#define NEOPIXEL_PIN   45
+#define NUM_PIXELS     1
+#define BRIGHTNESS     120
+
+/* ===================== RTOS sync & shared state ===================== */
+static SemaphoreHandle_t xNewSampleSem;   // báo có mẫu nhiệt độ mới
+static SemaphoreHandle_t xTempMutex;      // bảo vệ shared state
+static float    g_tempC      = NAN;
+static uint32_t g_lastMs     = 0;
+
+/* ===================== Drivers (private to this file) ===================== */
+static Adafruit_NeoPixel strip(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+static DHT20             dht20;  // Rob Tillaart lib
+
+/* ------------------ shared state helpers ------------------ */
+static void setTemp(float tC){
+  xSemaphoreTake(xTempMutex, portMAX_DELAY);
+  g_tempC  = tC;
+  g_lastMs = millis();
+  xSemaphoreGive(xTempMutex);
+}
+static void getTemp(float &tC, uint32_t &ageMs){
+  xSemaphoreTake(xTempMutex, portMAX_DELAY);
+  tC = g_tempC;
+  ageMs = millis() - g_lastMs;
+  xSemaphoreGive(xTempMutex);
+}
+
+/* ------------------ LED helpers ------------------ */
+static inline void ledRGB(uint8_t r,uint8_t g,uint8_t b){
+  strip.setPixelColor(0, strip.Color(r,g,b));
+  strip.show();
+}
+static inline void ledOff(){ ledRGB(0,0,0); }
+
+/* ===================== Policy: thresholds & colors ===================== */
+/* <20 -> BLUE ; 20..27 -> GREEN ; 27..30 -> YELLOW ; >30 -> RED */
+constexpr float T_BLUE_MAX    = 20.0f;
+constexpr float T_GREEN_MAX   = 27.0f;
+constexpr float T_YELLOW_MAX  = 30.0f;
+
+static const uint8_t BLUE_R=0,   BLUE_G=0,   BLUE_B=160;
+static const uint8_t GREEN_R=0,  GREEN_G=160, GREEN_B=0;
+static const uint8_t YELL_R=220, YELL_G=140,  YELL_B=0;
+static const uint8_t RED_R =220, RED_G =0,    RED_B =0;
+static const uint8_t STALE_R=120, STALE_G=0,  STALE_B=120;  // dữ liệu cũ/invalid
+
+/* ===================== Tasks ===================== */
+// (1) Producer: đọc DHT20 (PHẢI gọi read() trước khi get*)
+void TaskDHT20(void *){
+  Wire.begin(I2C1_SDA, I2C1_SCL);
+  Serial.printf("[I2C] SDA=%d SCL=%d\n", I2C1_SDA, I2C1_SCL);
+  vTaskDelay(pdMS_TO_TICKS(500)); // warm-up
+
+  for(;;){
+    int rc = dht20.read();
+    if (rc == DHT20_OK) {
+      float t = dht20.getTemperature();
+      if (t > -40.0f && t < 85.0f) {
+        setTemp(t);
+        xSemaphoreGive(xNewSampleSem);
+        Serial.printf("[DHT20] T=%.2f C\n", t);
+      } else {
+        Serial.printf("[DHT20] Invalid T: %.2f C\n", t);
+      }
+    } else {
+      Serial.printf("[DHT20] read() error rc=%d\n", rc);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+// (2) Consumer: đổi màu LED theo nhiệt độ; KHÔNG NHÁY (steady color)
+void TaskLED(void *){
+  strip.begin();
+  strip.setBrightness(BRIGHTNESS);
+  strip.show();
+
+  // power-on self-test ngắn
+  ledRGB(200,0,0);   vTaskDelay(pdMS_TO_TICKS(100));
+  ledRGB(0,200,0);   vTaskDelay(pdMS_TO_TICKS(100));
+  ledRGB(0,0,200);   vTaskDelay(pdMS_TO_TICKS(100));
+  ledOff();
+
+  enum class Mode { BLUE, GREEN, YELLOW, RED, STALE } mode = Mode::STALE;
+
+  for(;;){
+    xSemaphoreTake(xNewSampleSem, pdMS_TO_TICKS(1000));  // chờ tối đa 1s
+
+    float t; uint32_t age; getTemp(t, age);
+    const bool have  = !isnan(t);
+    const bool stale = (age > 8000);   // dữ liệu cũ >8s
+
+    Mode newMode;
+    if (!have || stale)           newMode = Mode::STALE;
+    else if (t <  T_BLUE_MAX)     newMode = Mode::BLUE;     // <20
+    else if (t <= T_GREEN_MAX)    newMode = Mode::GREEN;    // 20..27
+    else if (t <= T_YELLOW_MAX)   newMode = Mode::YELLOW;   // 27..30
+    else                          newMode = Mode::RED;      // >30
+
+    if (newMode != mode) {
+      mode = newMode;
+      const char* name =
+        mode==Mode::BLUE?"BLUE":
+        mode==Mode::GREEN?"GREEN":
+        mode==Mode::YELLOW?"YELLOW":
+        mode==Mode::RED?"RED":"STALE";
+      Serial.printf("[LED] Mode=%s (T=%.2fC)\n", name, t);
+
+      switch(mode){
+        case Mode::BLUE:   ledRGB(BLUE_R,  BLUE_G,  BLUE_B ); break;
+        case Mode::GREEN:  ledRGB(GREEN_R, GREEN_G, GREEN_B); break;
+        case Mode::YELLOW: ledRGB(YELL_R,  YELL_G,  YELL_B ); break;
+        case Mode::RED:    ledRGB(RED_R,   RED_G,   RED_B  ); break;
+        case Mode::STALE:  ledRGB(STALE_R, STALE_G, STALE_B); break;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(200)); // giữ CPU nhàn, LED vẫn giữ màu
+  }
+}
+
+/* ===================== Arduino entry ===================== */
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+
+  xNewSampleSem = xSemaphoreCreateBinary();
+  xTempMutex    = xSemaphoreCreateMutex();
+
+  // init NeoPixel sớm để bảo đảm tắt LED khi boot
+  strip.begin();
+  strip.setBrightness(BRIGHTNESS);
+  strip.show();
+
+  // start tasks trên 2 core
+  xTaskCreatePinnedToCore(TaskDHT20, "DHT20", 4096, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(TaskLED,   "LED",   4096, nullptr, 1, nullptr, 1);
+}
+
+void loop(){
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
