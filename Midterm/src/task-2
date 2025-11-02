@@ -1,0 +1,160 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+#include <DHT20.h>   // Rob Tillaart
+
+/* ===================== Yolo Uno S3 wiring ===================== */
+#define I2C1_SDA       7
+#define I2C1_SCL       6
+#define NEOPIXEL_PIN   45
+#define NUM_PIXELS     1
+#define BRIGHTNESS     120
+
+/* ===================== RTOS sync & shared state ===================== */
+static SemaphoreHandle_t xNewHumSem;    // producer -> consumer: new humidity sample
+static SemaphoreHandle_t xEnvMutex;     // protect shared temp/hum + timestamp
+
+static float    g_tempC   = NAN;
+static float    g_humRH   = NAN;
+static uint32_t g_lastMs  = 0;
+
+/* ===================== Drivers (private to this file) ===================== */
+static Adafruit_NeoPixel strip(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+static DHT20             dht20;  // Rob Tillaart lib
+
+/* ------------------ shared state helpers ------------------ */
+static void setEnv(float tC, float h){
+  xSemaphoreTake(xEnvMutex, portMAX_DELAY);
+  g_tempC = tC;
+  g_humRH = h;
+  g_lastMs = millis();
+  xSemaphoreGive(xEnvMutex);
+}
+static void getEnv(float &tC, float &h, uint32_t &ageMs){
+  xSemaphoreTake(xEnvMutex, portMAX_DELAY);
+  tC = g_tempC;
+  h  = g_humRH;
+  ageMs = millis() - g_lastMs;
+  xSemaphoreGive(xEnvMutex);
+}
+
+/* ------------------ LED helpers ------------------ */
+static inline void ledRGB(uint8_t r,uint8_t g,uint8_t b){
+  strip.setPixelColor(0, strip.Color(r,g,b));
+  strip.show();
+}
+static inline void ledOff(){ ledRGB(0,0,0); }
+
+/* ===================== Humidity mapping & colors ===================== */
+/* <40%  -> Amber (dry)
+   40–60 -> Green (comfort)
+   60–80 -> Blue  (humid)
+   >80   -> Purple (very humid)
+   Stale/Invalid -> Purple (steady) */
+constexpr float H_DRY_MAX      = 40.0f;
+constexpr float H_COMFORT_MAX  = 60.0f;
+constexpr float H_HUMID_MAX    = 80.0f;
+
+static const uint8_t AMBER_R=220, AMBER_G=140, AMBER_B=0;
+static const uint8_t GREEN_R=0,   GREEN_G=160,  GREEN_B=0;
+static const uint8_t BLUE_R =0,   BLUE_G =0,    BLUE_B =160;
+static const uint8_t PURP_R =120, PURP_G =0,    PURP_B =120;
+
+/* ===================== Tasks ===================== */
+// (1) Producer: đọc DHT20 mỗi 2s (PHẢI gọi read() trước get*)
+void TaskDHT20(void *){
+  Wire.begin(I2C1_SDA, I2C1_SCL);
+  Serial.printf("[I2C] SDA=%d SCL=%d\n", I2C1_SDA, I2C1_SCL);
+  vTaskDelay(pdMS_TO_TICKS(500)); // warm-up
+
+  for(;;){
+    int rc = dht20.read();
+    if (rc == DHT20_OK) {
+      float t = dht20.getTemperature();
+      float h = dht20.getHumidity();  // %RH 0..100
+      bool t_ok = (t > -40.0f && t < 85.0f);
+      bool h_ok = (h >= 0.0f  && h <= 100.0f);
+      if (t_ok && h_ok) {
+        setEnv(t, h);
+        xSemaphoreGive(xNewHumSem);
+        Serial.printf("[ENV] T=%.2f C  H=%.1f %%\n", t, h);
+      } else {
+        Serial.printf("[ENV] Invalid: T=%.2f  H=%.1f\n", t, h);
+      }
+    } else {
+      Serial.printf("[ENV] read() error rc=%d\n", rc);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+// (2) Consumer: NeoPixel hiển thị màu THEO ĐỘ ẨM (steady color, không nháy)
+void TaskLED_Humidity(void *){
+  strip.begin();
+  strip.setBrightness(BRIGHTNESS);
+  strip.show();
+
+  // power-on self-test ngắn
+  ledRGB(200,0,0);   vTaskDelay(pdMS_TO_TICKS(100));
+  ledRGB(0,200,0);   vTaskDelay(pdMS_TO_TICKS(100));
+  ledRGB(0,0,200);   vTaskDelay(pdMS_TO_TICKS(100));
+  ledOff();
+
+  enum class HMode { DRY, COMFORT, HUMID, VERY_HUMID, STALE } mode = HMode::STALE;
+
+  for(;;){
+    // chờ tối đa 1s cho mẫu độ ẩm mới
+    xSemaphoreTake(xNewHumSem, pdMS_TO_TICKS(1000));
+
+    float t, h; uint32_t age; getEnv(t, h, age);
+    const bool have  = !isnan(h);
+    const bool stale = (age > 8000);
+
+    HMode newMode;
+    if (!have || stale)         newMode = HMode::STALE;
+    else if (h <  H_DRY_MAX)    newMode = HMode::DRY;         // <40
+    else if (h <= H_COMFORT_MAX)newMode = HMode::COMFORT;     // 40..60
+    else if (h <= H_HUMID_MAX)  newMode = HMode::HUMID;       // 60..80
+    else                        newMode = HMode::VERY_HUMID;  // >80
+
+    if (newMode != mode) {
+      mode = newMode;
+      const char* name =
+        mode==HMode::DRY?"DRY":
+        mode==HMode::COMFORT?"COMFORT":
+        mode==HMode::HUMID?"HUMID":
+        mode==HMode::VERY_HUMID?"VERY_HUMID":"STALE";
+      Serial.printf("[LED-H] %s (H=%.1f%%)\n", name, h);
+
+      switch(mode){
+        case HMode::DRY:        ledRGB(AMBER_R, AMBER_G, AMBER_B); break;
+        case HMode::COMFORT:    ledRGB(GREEN_R, GREEN_G, GREEN_B); break;
+        case HMode::HUMID:      ledRGB(BLUE_R,  BLUE_G,  BLUE_B ); break;
+        case HMode::VERY_HUMID: ledRGB(PURP_R,  PURP_G,  PURP_B ); break;
+        case HMode::STALE:      ledRGB(PURP_R,  PURP_G,  PURP_B ); break; // dữ liệu cũ/invalid
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(200)); // giữ CPU nhàn, LED vẫn giữ màu
+  }
+}
+
+/* ===================== Arduino entry ===================== */
+void setup(){
+  Serial.begin(115200);
+  delay(200);
+
+  xNewHumSem = xSemaphoreCreateBinary();
+  xEnvMutex  = xSemaphoreCreateMutex();
+
+  strip.begin();
+  strip.setBrightness(BRIGHTNESS);
+  strip.show();
+
+  xTaskCreatePinnedToCore(TaskDHT20,         "DHT20",        4096, nullptr, 2, nullptr, 0);
+  xTaskCreatePinnedToCore(TaskLED_Humidity,  "LED_Humidity", 4096, nullptr, 1, nullptr, 1);
+}
+
+void loop(){
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
