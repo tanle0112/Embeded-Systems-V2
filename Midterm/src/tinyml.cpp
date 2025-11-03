@@ -66,15 +66,15 @@ void TaskTinyML(void *pvParameters) {
     // --- LED behavior ---
     if (score < 0.35) {          // Normal
       Neo_setRGB1(0, 255, 0);    // Green
-      Serial.println("[TinyML] ✅ Normal condition");
+      Serial.println("[TinyML] Normal condition");
     } 
     else if (score < 0.6) {      // Warning
       Neo_setRGB1(255, 255, 0);  // Yellow
-      Serial.println("[TinyML] ⚠️ Warning condition");
+      Serial.println("[TinyML] Warning condition");
     } 
     else {                       // Anomaly
       Neo_setRGB1(255, 0, 0);    // Red
-      Serial.println("[TinyML] 🚨 Anomaly detected!");
+      Serial.println("[TinyML] Anomaly detected!");
     }
 
     vTaskDelayUntil(&lastWake, period);
