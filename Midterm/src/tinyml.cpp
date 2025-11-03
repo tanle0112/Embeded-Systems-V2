@@ -1,75 +1,82 @@
 #include "tinyml.h"
 
-// Globals, for the convenience of one-shot setup.
-namespace
-{
-    tflite::ErrorReporter *error_reporter = nullptr;
-    const tflite::Model *model = nullptr;
-    tflite::MicroInterpreter *interpreter = nullptr;
-    TfLiteTensor *input = nullptr;
-    TfLiteTensor *output = nullptr;
-    constexpr int kTensorArenaSize = 8 * 1024; // Adjust size based on your model
-    uint8_t tensor_arena[kTensorArenaSize];
-} // namespace
+// ===== TensorFlow Lite globals =====
+namespace {
+  tflite::MicroErrorReporter micro_error_reporter;
+  tflite::AllOpsResolver resolver;
+  const tflite::Model* model = nullptr;
+  tflite::MicroInterpreter* interpreter = nullptr;
+  TfLiteTensor* input = nullptr;
+  TfLiteTensor* output = nullptr;
 
-void setupTinyML()
-{
-    Serial.println("TensorFlow Lite Init....");
-    static tflite::MicroErrorReporter micro_error_reporter;
-    error_reporter = &micro_error_reporter;
-
-    model = tflite::GetModel(dht_anomaly_model_tflite); // g_model_data is from model_data.h
-    if (model->version() != TFLITE_SCHEMA_VERSION)
-    {
-        error_reporter->Report("Model provided is schema version %d, not equal to supported version %d.",
-                               model->version(), TFLITE_SCHEMA_VERSION);
-        return;
-    }
-
-    static tflite::AllOpsResolver resolver;
-    static tflite::MicroInterpreter static_interpreter(
-        model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
-    interpreter = &static_interpreter;
-
-    TfLiteStatus allocate_status = interpreter->AllocateTensors();
-    if (allocate_status != kTfLiteOk)
-    {
-        error_reporter->Report("AllocateTensors() failed");
-        return;
-    }
-
-    input = interpreter->input(0);
-    output = interpreter->output(0);
-
-    Serial.println("TensorFlow Lite Micro initialized on ESP32.");
+  constexpr int kTensorArenaSize = 25 * 1024;   // increased arena
+  static uint8_t tensor_arena[kTensorArenaSize];
 }
 
-void tiny_ml_task(void *pvParameters)
-{
+// ===== Initialize model =====
+void setupTinyML() {
+  Serial.println("[TinyML] Initializing TensorFlow Lite model...");
 
-    setupTinyML();
+  model = tflite::GetModel(dht_anomaly_model);
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("[TinyML] Schema mismatch: model %d vs TFLM %d\n",
+                  model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
 
-    while (1)
-    {
+  interpreter = new tflite::MicroInterpreter(model, resolver,
+                                             tensor_arena, kTensorArenaSize,
+                                             &micro_error_reporter);
 
-        // Prepare input data (e.g., sensor readings)
-        // For a simple example, let's assume a single float input
-        input->data.f[0] = glob_temperature;
-        input->data.f[1] = glob_humidity;
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println("[TinyML] AllocateTensors FAILED!");
+    return;
+  }
 
-        // Run inference
-        TfLiteStatus invoke_status = interpreter->Invoke();
-        if (invoke_status != kTfLiteOk)
-        {
-            error_reporter->Report("Invoke failed");
-            return;
-        }
+  input  = interpreter->input(0);
+  output = interpreter->output(0);
+  Serial.println("[TinyML] Model ready.");
+}
 
-        // Get and process output
-        float result = output->data.f[0];
-        Serial.print("Inference result: ");
-        Serial.println(result);
+// ===== Main inference task =====
+void TaskTinyML(void *pvParameters) {
+  const TickType_t period = pdMS_TO_TICKS(1000);
+  TickType_t lastWake = xTaskGetTickCount();
 
-        vTaskDelay(5000);
+  while (true) {
+    // --- Read sensor data ---
+    float t = getTemperature();
+    float h = getHumidity();
+    Serial.printf("[TinyML] Temp=%.2f°C, Humi=%.2f%%\n", t, h);
+
+    // --- Normalize input ---
+    input->data.f[0] = t / 50.0f;
+    input->data.f[1] = h / 100.0f;
+
+    // --- Inference ---
+    if (interpreter->Invoke() != kTfLiteOk) {
+      Serial.println("[TinyML] Inference failed!");
+      vTaskDelayUntil(&lastWake, period);
+      continue;
     }
+
+    float score = output->data.f[0];  // anomaly probability
+    Serial.printf("[TinyML] Score=%.3f\n", score);
+
+    // --- LED behavior ---
+    if (score < 0.35) {          // Normal
+      Neo_setRGB1(0, 255, 0);    // Green
+      Serial.println("[TinyML] ✅ Normal condition");
+    } 
+    else if (score < 0.6) {      // Warning
+      Neo_setRGB1(255, 255, 0);  // Yellow
+      Serial.println("[TinyML] ⚠️ Warning condition");
+    } 
+    else {                       // Anomaly
+      Neo_setRGB1(255, 0, 0);    // Red
+      Serial.println("[TinyML] 🚨 Anomaly detected!");
+    }
+
+    vTaskDelayUntil(&lastWake, period);
+  }
 }
